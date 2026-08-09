@@ -102,10 +102,41 @@ static void test_zero_size_pagefile_mapping_fails(void) {
 	TEST_CHECK_EQ(ERROR_INVALID_PARAMETER, GetLastError());
 }
 
+static void test_fixed_view_reuses_released_address(void) {
+	const SIZE_T mapping_size = 128 * 1024;
+	uint8_t *address = (uint8_t *)VirtualAlloc(NULL, mapping_size, MEM_RESERVE, PAGE_NOACCESS);
+	TEST_CHECK_MSG(address != NULL, "VirtualAlloc failed: %lu", GetLastError());
+
+	HANDLE mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, mapping_size, NULL);
+	TEST_CHECK_MSG(mapping != NULL, "CreateFileMappingA failed: %lu", GetLastError());
+
+	SetLastError(0xdeadbeef);
+	TEST_CHECK(MapViewOfFileEx(mapping, FILE_MAP_ALL_ACCESS, 0, 0, mapping_size, address) == NULL);
+	TEST_CHECK_EQ(ERROR_INVALID_ADDRESS, GetLastError());
+
+	TEST_CHECK_MSG(VirtualFree(address, 0, MEM_RELEASE), "VirtualFree failed: %lu", GetLastError());
+	uint8_t *view = (uint8_t *)MapViewOfFileEx(mapping, FILE_MAP_ALL_ACCESS, 0, 0, mapping_size, address);
+	TEST_CHECK_MSG(view == address, "MapViewOfFileEx returned %p instead of %p: %lu", view, address, GetLastError());
+	view[0] = 0x19;
+	view[mapping_size - 1] = 0x96;
+	TEST_CHECK_EQ(0x19u, view[0]);
+	TEST_CHECK_EQ(0x96u, view[mapping_size - 1]);
+
+	MEMORY_BASIC_INFORMATION info;
+	TEST_CHECK_EQ(sizeof(info), VirtualQuery(view, &info, sizeof(info)));
+	TEST_CHECK_EQ(MEM_COMMIT, info.State);
+	TEST_CHECK_EQ(MEM_MAPPED, info.Type);
+	TEST_CHECK(info.AllocationBase == view);
+
+	TEST_CHECK(UnmapViewOfFile(view));
+	TEST_CHECK(CloseHandle(mapping));
+}
+
 int main(void) {
 	test_readwrite_mapping_extends_file();
 	test_copy_mapping_does_not_write_file();
 	test_zero_size_file_mapping_fails();
 	test_zero_size_pagefile_mapping_fails();
+	test_fixed_view_reuses_released_address();
 	return 0;
 }
