@@ -4,6 +4,7 @@
 #include "context.h"
 #include "errors.h"
 #include "kernel32/internal.h"
+#include "kernel32/winnls.h"
 #include "modules.h"
 #include "resources.h"
 
@@ -21,6 +22,24 @@ struct USEROBJECTFLAGS {
 	BOOL fReserved;
 	DWORD dwFlags;
 };
+
+LPSTR WINAPI CharNextA(LPCSTR lpsz) {
+	HOST_CONTEXT_GUARD();
+	DEBUG_LOG("CharNextA(%p)\n", lpsz);
+	return CharNextExA(static_cast<WORD>(kernel32::GetACP()), lpsz, 0);
+}
+
+LPSTR WINAPI CharNextExA(WORD CodePage, LPCSTR lpCurrentChar, DWORD dwFlags) {
+	HOST_CONTEXT_GUARD();
+	DEBUG_LOG("CharNextExA(%u, %p, %u)\n", CodePage, lpCurrentChar, dwFlags);
+	(void)dwFlags;
+	auto *current = const_cast<LPSTR>(lpCurrentChar);
+	if (*current == '\0')
+		return current;
+	if (kernel32::IsDBCSLeadByteEx(CodePage, static_cast<BYTE>(*current)) && current[1] != '\0')
+		return current + 2;
+	return current + 1;
+}
 
 int WINAPI LoadStringA(HMODULE hInstance, UINT uID, LPSTR lpBuffer, int cchBufferMax) {
 	HOST_CONTEXT_GUARD();

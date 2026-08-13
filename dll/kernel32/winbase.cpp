@@ -8,6 +8,7 @@
 #include "internal.h"
 #include "mimalloc/types.h"
 #include "modules.h"
+#include "resources.h"
 #include "strutil.h"
 #include "types.h"
 
@@ -15,13 +16,14 @@
 #include <cassert>
 #include <cctype>
 #include <cerrno>
-#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
 #include <mimalloc.h>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <sys/mman.h>
 #include <sys/statvfs.h>
@@ -31,7 +33,6 @@
 #elif defined(__linux__)
 #include <sys/sysinfo.h>
 #endif
-#include <system_error>
 #include <unordered_map>
 #include <vector>
 
@@ -49,6 +50,275 @@ constexpr ATOM kMaxIntegerAtom = 0xBFFF;
 constexpr ATOM kMinStringAtom = 0xC000;
 constexpr ATOM kMaxStringAtom = 0xFFFF;
 
+constexpr DWORD FORMAT_MESSAGE_ALLOCATE_BUFFER = 0x00000100;
+constexpr DWORD FORMAT_MESSAGE_IGNORE_INSERTS = 0x00000200;
+constexpr DWORD FORMAT_MESSAGE_FROM_STRING = 0x00000400;
+constexpr DWORD FORMAT_MESSAGE_FROM_HMODULE = 0x00000800;
+constexpr DWORD FORMAT_MESSAGE_FROM_SYSTEM = 0x00001000;
+constexpr DWORD FORMAT_MESSAGE_ARGUMENT_ARRAY = 0x00002000;
+constexpr DWORD FORMAT_MESSAGE_MAX_WIDTH_MASK = 0x000000FF;
+constexpr DWORD FORMAT_MESSAGE_SOURCE_MASK =
+	FORMAT_MESSAGE_FROM_STRING | FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_FROM_SYSTEM;
+constexpr DWORD FORMAT_MESSAGE_VALID_FLAGS = FORMAT_MESSAGE_MAX_WIDTH_MASK | FORMAT_MESSAGE_ALLOCATE_BUFFER |
+											 FORMAT_MESSAGE_IGNORE_INSERTS | FORMAT_MESSAGE_SOURCE_MASK |
+											 FORMAT_MESSAGE_ARGUMENT_ARRAY;
+constexpr uint16_t MESSAGE_RESOURCE_UNICODE = 0x0001;
+constexpr uint32_t RT_MESSAGETABLE = 11;
+
+struct MessageResourceBlock {
+	DWORD lowId;
+	DWORD highId;
+	DWORD offsetToEntries;
+};
+
+struct MessageResourceEntry {
+	WORD length;
+	WORD flags;
+};
+
+std::optional<std::string> systemMessage(DWORD messageId) {
+	// These strings match the message table used by the Win9x-era tools wibo
+	// targets. Keep the CRLF: it is part of the message resource.
+	switch (messageId) {
+	case ERROR_SUCCESS:
+		return "The operation completed successfully.\r\n";
+	case ERROR_FILE_NOT_FOUND:
+		return "File not found.\r\n";
+	case ERROR_PATH_NOT_FOUND:
+		return "Path not found.\r\n";
+	case ERROR_ACCESS_DENIED:
+		return "Access denied.\r\n";
+	case ERROR_INVALID_HANDLE:
+		return "Invalid handle.\r\n";
+	case ERROR_NOT_ENOUGH_MEMORY:
+		return "Not enough memory.\r\n";
+	case ERROR_NO_MORE_FILES:
+		return "No more files.\r\n";
+	case ERROR_READ_FAULT:
+		return "The system cannot read from the specified device.\r\n";
+	case ERROR_GEN_FAILURE:
+		return "A device attached to the system is not functioning.\r\n";
+	case ERROR_HANDLE_EOF:
+		return "Reached the end of the file.\r\n";
+	case ERROR_NOT_SUPPORTED:
+		return "The request is not supported.\r\n";
+	case ERROR_FILE_EXISTS:
+		return "The file exists.\r\n";
+	case ERROR_INVALID_PARAMETER:
+		return "The parameter is incorrect.\r\n";
+	case ERROR_BUFFER_OVERFLOW:
+		return "The file name is too long.\r\n";
+	case ERROR_DISK_FULL:
+		return "There is not enough space on the disk.\r\n";
+	case ERROR_CALL_NOT_IMPLEMENTED:
+		return "This function is not supported on this system.\r\n";
+	case ERROR_INSUFFICIENT_BUFFER:
+		return "The data area passed to a system call is too small.\r\n";
+	case ERROR_INVALID_NAME:
+		return "The filename, directory name, or volume label syntax is incorrect.\r\n";
+	case ERROR_MOD_NOT_FOUND:
+		return "The specified module could not be found.\r\n";
+	case ERROR_PROC_NOT_FOUND:
+		return "The specified procedure could not be found.\r\n";
+	case ERROR_NEGATIVE_SEEK:
+		return "An attempt was made to move the file pointer before the beginning of the file.\r\n";
+	case ERROR_ALREADY_EXISTS:
+		return "Cannot create a file when that file already exists.\r\n";
+	case ERROR_BAD_EXE_FORMAT:
+		return "%1 is not a valid Win32 application.\r\n";
+	case ERROR_ENVVAR_NOT_FOUND:
+		return "The system could not find the environment option that was entered.\r\n";
+	case ERROR_NO_MORE_ITEMS:
+		return "No more data is available.\r\n";
+	case ERROR_TIMEOUT:
+		return "This operation returned because the timeout period expired.\r\n";
+	default:
+		return std::nullopt;
+	}
+}
+
+std::optional<std::string> moduleMessage(HMODULE module, DWORD messageId, DWORD languageId) {
+	auto *exe = wibo::executableFromModule(module);
+	if (!exe)
+		return std::nullopt;
+
+	wibo::ResourceLocation resource;
+	std::optional<uint16_t> language;
+	if (languageId != 0)
+		language = static_cast<uint16_t>(languageId);
+	if (!exe->findResource(wibo::ResourceIdentifier::fromID(RT_MESSAGETABLE), wibo::ResourceIdentifier::fromID(1),
+						   language, resource)) {
+		return std::nullopt;
+	}
+
+	if (resource.size < sizeof(DWORD))
+		return std::nullopt;
+	const auto *base = static_cast<const uint8_t *>(resource.data);
+	DWORD blockCount;
+	std::memcpy(&blockCount, base, sizeof(blockCount));
+	if (blockCount > (resource.size - sizeof(DWORD)) / sizeof(MessageResourceBlock))
+		return std::nullopt;
+	const auto *blocks = reinterpret_cast<const MessageResourceBlock *>(base + sizeof(DWORD));
+	for (DWORD blockIndex = 0; blockIndex < blockCount; ++blockIndex) {
+		const auto &block = blocks[blockIndex];
+		if (messageId < block.lowId || messageId > block.highId || block.offsetToEntries >= resource.size)
+			continue;
+		size_t offset = block.offsetToEntries;
+		for (DWORD currentId = block.lowId; currentId <= messageId; ++currentId) {
+			if (resource.size - offset < sizeof(MessageResourceEntry))
+				return std::nullopt;
+			const auto *entry = reinterpret_cast<const MessageResourceEntry *>(base + offset);
+			if (entry->length < sizeof(MessageResourceEntry) || entry->length > resource.size - offset)
+				return std::nullopt;
+			if (currentId == messageId) {
+				const uint8_t *text = base + offset + sizeof(MessageResourceEntry);
+				size_t byteLength = entry->length - sizeof(MessageResourceEntry);
+				if (entry->flags & MESSAGE_RESOURCE_UNICODE) {
+					const auto *wide = reinterpret_cast<const uint16_t *>(text);
+					size_t charLength = byteLength / sizeof(uint16_t);
+					while (charLength && wide[charLength - 1] == 0)
+						--charLength;
+					return wideStringToString(wide, charLength);
+				}
+				while (byteLength && text[byteLength - 1] == 0)
+					--byteLength;
+				return std::string(reinterpret_cast<const char *>(text), byteLength);
+			}
+			offset += entry->length;
+		}
+	}
+	return std::nullopt;
+}
+
+std::string formatIntegerArgument(const std::string &specification, DWORD_PTR value, char conversion) {
+	std::string hostFormat = "%" + specification;
+	char buffer[128];
+	int length;
+	if (conversion == 'd' || conversion == 'i') {
+		length = std::snprintf(buffer, sizeof(buffer), hostFormat.c_str(), static_cast<int32_t>(value));
+	} else {
+		length = std::snprintf(buffer, sizeof(buffer), hostFormat.c_str(), static_cast<uint32_t>(value));
+	}
+	if (length < 0)
+		return {};
+	return std::string(buffer, std::min(static_cast<size_t>(length), sizeof(buffer) - 1));
+}
+
+std::string formatStringArgument(const std::string &specification, const std::string &value) {
+	size_t conversion = specification.find_last_of("sS");
+	if (conversion == std::string::npos)
+		return value;
+	std::string hostSpecification = specification.substr(0, conversion);
+	hostSpecification.erase(std::remove(hostSpecification.begin(), hostSpecification.end(), 'w'),
+							hostSpecification.end());
+	hostSpecification.erase(std::remove(hostSpecification.begin(), hostSpecification.end(), 'l'),
+							hostSpecification.end());
+	hostSpecification += 's';
+	char buffer[4096];
+	int length = std::snprintf(buffer, sizeof(buffer), ("%" + hostSpecification).c_str(), value.c_str());
+	if (length < 0)
+		return {};
+	return std::string(buffer, std::min(static_cast<size_t>(length), sizeof(buffer) - 1));
+}
+
+bool formatMessageText(const std::string &source, DWORD flags, GUEST_PTR arguments, std::string &result) {
+	const DWORD_PTR *values = nullptr;
+	if (arguments) {
+		if (flags & FORMAT_MESSAGE_ARGUMENT_ARRAY) {
+			values = fromGuestPtr<DWORD_PTR>(arguments);
+		} else {
+			GUEST_PTR argumentList = *fromGuestPtr<GUEST_PTR>(arguments);
+			values = fromGuestPtr<DWORD_PTR>(argumentList);
+		}
+	}
+
+	for (size_t position = 0; position < source.size();) {
+		if (source[position] != '%' || position + 1 == source.size()) {
+			result += source[position++];
+			continue;
+		}
+
+		size_t start = position++;
+		char escape = source[position];
+		if (escape >= '0' && escape <= '9') {
+			unsigned index = 0;
+			while (position < source.size() && source[position] >= '0' && source[position] <= '9')
+				index = index * 10 + static_cast<unsigned>(source[position++] - '0');
+			if (index == 0)
+				break;
+			std::string specification = "s";
+			if (position < source.size() && source[position] == '!') {
+				size_t end = source.find('!', position + 1);
+				if (end == std::string::npos) {
+					kernel32::setLastError(ERROR_INVALID_PARAMETER);
+					return false;
+				}
+				specification = source.substr(position + 1, end - position - 1);
+				position = end + 1;
+			}
+			if (flags & FORMAT_MESSAGE_IGNORE_INSERTS) {
+				result.append(source, start, position - start);
+				continue;
+			}
+			if (!values || index > 99 || specification.empty()) {
+				kernel32::setLastError(ERROR_INVALID_PARAMETER);
+				return false;
+			}
+			DWORD_PTR value = values[index - 1];
+			char conversion = specification.back();
+			if (conversion == 's' || conversion == 'S') {
+				bool wide = conversion == 'S' || specification.find('w') != std::string::npos ||
+							specification.find('l') != std::string::npos;
+				std::string stringValue;
+				if (value) {
+					if (wide)
+						stringValue = wideStringToString(reinterpret_cast<LPCWSTR>(value));
+					else
+						stringValue = reinterpret_cast<LPCSTR>(value);
+				}
+				result += formatStringArgument(specification, stringValue);
+			} else if (conversion == 'c' || conversion == 'C') {
+				result += static_cast<char>(value);
+			} else if (conversion == 'd' || conversion == 'i' || conversion == 'u' || conversion == 'x' ||
+					   conversion == 'X' || conversion == 'o') {
+				result += formatIntegerArgument(specification, value, conversion);
+			} else {
+				kernel32::setLastError(ERROR_INVALID_PARAMETER);
+				return false;
+			}
+			continue;
+		}
+
+		++position;
+		switch (escape) {
+		case 'n':
+			result += "\r\n";
+			break;
+		case 'r':
+			result += '\r';
+			break;
+		case 't':
+			result += '\t';
+			break;
+		case '%':
+			if (flags & FORMAT_MESSAGE_IGNORE_INSERTS)
+				result += "%%";
+			else
+				result += '%';
+			break;
+		case ' ':
+		case '.':
+		case '!':
+			result += escape;
+			break;
+		default:
+			result.append(source, start, 2);
+			break;
+		}
+	}
+	return true;
+}
+
 SIZE_T clampToSizeT(uint64_t value) {
 	constexpr uint64_t kMaxSizeT = static_cast<uint64_t>(std::numeric_limits<SIZE_T>::max());
 	return value > kMaxSizeT ? static_cast<SIZE_T>(kMaxSizeT) : static_cast<SIZE_T>(value);
@@ -63,7 +333,7 @@ struct MemorySnapshot {
 
 bool queryHostMemory(MemorySnapshot &out) {
 #if defined(__linux__)
-	struct sysinfo info {};
+	struct sysinfo info{};
 	if (sysinfo(&info) != 0) {
 		return false;
 	}
@@ -88,7 +358,7 @@ bool queryHostMemory(MemorySnapshot &out) {
 	if (host_page_size(mach_host_self(), &pageSize) != KERN_SUCCESS || pageSize == 0) {
 		return false;
 	}
-	vm_statistics64_data_t vmstat {};
+	vm_statistics64_data_t vmstat{};
 	mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
 	if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vmstat), &count) !=
 		KERN_SUCCESS) {
@@ -99,7 +369,7 @@ bool queryHostMemory(MemorySnapshot &out) {
 	out.totalPhys = totalPhys;
 	out.availPhys = freePages * static_cast<uint64_t>(pageSize);
 
-	struct xsw_usage swap {};
+	struct xsw_usage swap{};
 	size_t swapSize = sizeof(swap);
 	if (sysctlbyname("vm.swapusage", &swap, &swapSize, nullptr, 0) == 0 && swapSize == sizeof(swap)) {
 		out.totalPageFile = swap.xsu_total;
@@ -592,48 +862,65 @@ UINT WINAPI SetHandleCount(UINT uNumber) {
 }
 
 DWORD WINAPI FormatMessageA(DWORD dwFlags, LPCVOID lpSource, DWORD dwMessageId, DWORD dwLanguageId, LPSTR lpBuffer,
-							DWORD nSize, va_list *Arguments) {
+							DWORD nSize, GUEST_PTR Arguments) {
 	HOST_CONTEXT_GUARD();
 	DEBUG_LOG("FormatMessageA(%u, %p, %u, %u, %p, %u, %p)\n", dwFlags, lpSource, dwMessageId, dwLanguageId, lpBuffer,
-			  nSize, Arguments);
+			  nSize, reinterpret_cast<void *>(static_cast<uintptr_t>(Arguments)));
 
-	if (dwFlags & 0x00000100) {
-		// FORMAT_MESSAGE_ALLOCATE_BUFFER
-	} else if (dwFlags & 0x00002000) {
-		// FORMAT_MESSAGE_ARGUMENT_ARRAY
-	} else if (dwFlags & 0x00000800) {
-		// FORMAT_MESSAGE_FROM_HMODULE
-	} else if (dwFlags & 0x00000400) {
-		// FORMAT_MESSAGE_FROM_STRING
-	} else if (dwFlags & 0x00001000) {
-		// FORMAT_MESSAGE_FROM_SYSTEM
-		std::string message = std::system_category().message(static_cast<int>(dwMessageId));
-		size_t length = message.length();
-		if (!lpBuffer || nSize == 0) {
-			setLastError(ERROR_INSUFFICIENT_BUFFER);
+	if ((dwFlags & ~FORMAT_MESSAGE_VALID_FLAGS) != 0 || (dwFlags & FORMAT_MESSAGE_SOURCE_MASK) == 0 ||
+		((dwFlags & FORMAT_MESSAGE_FROM_STRING) && (dwFlags & FORMAT_MESSAGE_FROM_HMODULE))) {
+		setLastError(ERROR_INVALID_PARAMETER);
+		return 0;
+	}
+
+	std::optional<std::string> message;
+	if (dwFlags & FORMAT_MESSAGE_FROM_STRING) {
+		if (!lpSource) {
+			setLastError(ERROR_INVALID_PARAMETER);
 			return 0;
 		}
-		std::strncpy(lpBuffer, message.c_str(), static_cast<size_t>(nSize));
-		if (static_cast<size_t>(nSize) <= length) {
-			if (static_cast<size_t>(nSize) > 0) {
-				lpBuffer[nSize - 1] = '\0';
-			}
-			setLastError(ERROR_INSUFFICIENT_BUFFER);
+		message = static_cast<LPCSTR>(lpSource);
+	} else if (dwFlags & FORMAT_MESSAGE_FROM_HMODULE) {
+		HMODULE module = lpSource ? static_cast<HMODULE>(reinterpret_cast<uintptr_t>(lpSource)) : 0;
+		message = moduleMessage(module, dwMessageId, dwLanguageId);
+	}
+	if (!message && (dwFlags & FORMAT_MESSAGE_FROM_SYSTEM))
+		message = systemMessage(dwMessageId);
+	if (!message) {
+		setLastError(ERROR_MR_MID_NOT_FOUND);
+		return 0;
+	}
+
+	std::string formatted;
+	if (!formatMessageText(*message, dwFlags, Arguments, formatted))
+		return 0;
+	if (formatted.size() > 0xFFFF) {
+		setLastError(ERROR_MORE_DATA);
+		return 0;
+	}
+
+	if (dwFlags & FORMAT_MESSAGE_ALLOCATE_BUFFER) {
+		if (!lpBuffer) {
+			setLastError(ERROR_INVALID_PARAMETER);
 			return 0;
 		}
-		lpBuffer[length] = '\0';
-		return static_cast<DWORD>(length);
-	} else if (dwFlags & 0x00000200) {
-		// FORMAT_MESSAGE_IGNORE_INSERTS
+		size_t allocationSize = std::max(static_cast<size_t>(nSize), formatted.size() + 1);
+		HLOCAL allocation = LocalAlloc(0, static_cast<SIZE_T>(allocationSize));
+		if (!allocation)
+			return 0;
+		auto *output = fromGuestPtr<char>(allocation);
+		std::memcpy(output, formatted.c_str(), formatted.size() + 1);
+		*reinterpret_cast<GUEST_PTR *>(lpBuffer) = allocation;
 	} else {
-		// unhandled?
+		if (!lpBuffer || nSize <= formatted.size()) {
+			setLastError(ERROR_INSUFFICIENT_BUFFER);
+			return 0;
+		}
+		std::memcpy(lpBuffer, formatted.c_str(), formatted.size() + 1);
 	}
 
-	if (lpBuffer && nSize > 0) {
-		lpBuffer[0] = '\0';
-	}
-	setLastError(ERROR_CALL_NOT_IMPLEMENTED);
-	return 0;
+	DEBUG_LOG("FormatMessageA -> %zu bytes: %s\n", formatted.size(), formatted.c_str());
+	return static_cast<DWORD>(formatted.size());
 }
 
 PVOID WINAPI EncodePointer(PVOID Ptr) {
