@@ -195,6 +195,7 @@ add_executable(wibo
     dll/advapi32/wincrypt.cpp
     dll/advapi32/winreg.cpp
     dll/bcrypt.cpp
+    dll/imagehlp.cpp
     dll/kernel32.cpp
     dll/kernel32/debugapi.cpp
     dll/kernel32/errhandlingapi.cpp
@@ -380,6 +381,7 @@ wibo_codegen_module(NAME advapi32 HEADERS
 )
 wibo_codegen_module(NAME bcrypt HEADERS dll/bcrypt.h)
 wibo_codegen_module(NAME entry HEADERS src/entry.h)
+wibo_codegen_module(NAME imagehlp HEADERS dll/imagehlp.h)
 wibo_codegen_module(NAME mscoree HEADERS dll/mscoree.h)
 wibo_codegen_module(NAME version HEADERS dll/version.h)
 wibo_codegen_module(NAME rpcrt4 HEADERS dll/rpcrt4.h)
@@ -486,6 +488,7 @@ if (WIBO_ENABLE_FIXTURE_TESTS)
         wibo_add_fixture_bin(NAME test_bcrypt SOURCES test/test_bcrypt.c COMPILE_OPTIONS -lbcrypt)
         wibo_add_fixture_bin(NAME test_charnext SOURCES test/test_charnext.c)
         wibo_add_fixture_bin(NAME test_shlwapi SOURCES test/test_shlwapi.c COMPILE_OPTIONS -lshlwapi)
+        wibo_add_fixture_bin(NAME test_imagehlp SOURCES test/test_imagehlp.c COMPILE_OPTIONS -limagehlp)
         wibo_add_fixture_bin(NAME test_ws2 SOURCES test/test_ws2.c COMPILE_OPTIONS -lws2_32)
         wibo_add_fixture_bin(NAME test_resources SOURCES test/test_resources.c ${WIBO_TEST_BIN_DIR}/test_resources_res.o COMPILE_OPTIONS -lversion)
         wibo_add_fixture_bin(NAME test_threading SOURCES test/test_threading.c)
