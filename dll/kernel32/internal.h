@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <optional>
 #include <pthread.h>
+#include <unordered_set>
 
 namespace kernel32 {
 
@@ -161,6 +162,8 @@ struct HeapObject : public ObjectBase {
 	SIZE_T maximumSize = 0;
 	DWORD compatibility = 0;
 	bool isProcessHeap = false;
+	mutable std::mutex allocationsMutex;
+	std::unordered_set<const void *> allocations;
 
 	explicit HeapObject(std::optional<wibo::Heap> heap)
 		: ObjectBase(kType), heap(std::move(heap)), owner(pthread_self()) {}
@@ -168,6 +171,30 @@ struct HeapObject : public ObjectBase {
 
 	[[nodiscard]] inline bool isOwner() const { return pthread_equal(owner, pthread_self()); }
 	[[nodiscard]] inline bool canAccess() const { return isProcessHeap || (isOwner() && heap.has_value()); }
+
+	void trackAllocation(const void *ptr) {
+		std::lock_guard lock(allocationsMutex);
+		allocations.insert(ptr);
+	}
+
+	bool replaceAllocation(const void *oldPtr, const void *newPtr) {
+		std::lock_guard lock(allocationsMutex);
+		if (allocations.erase(oldPtr) == 0) {
+			return false;
+		}
+		allocations.insert(newPtr);
+		return true;
+	}
+
+	bool releaseAllocation(const void *ptr) {
+		std::lock_guard lock(allocationsMutex);
+		return allocations.erase(ptr) != 0;
+	}
+
+	[[nodiscard]] bool ownsAllocation(const void *ptr) const {
+		std::lock_guard lock(allocationsMutex);
+		return allocations.contains(ptr);
+	}
 };
 
 inline constexpr HANDLE kPseudoCurrentProcessHandleValue = static_cast<HANDLE>(-1);

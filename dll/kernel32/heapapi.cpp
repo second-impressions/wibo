@@ -57,6 +57,7 @@ LPVOID heapAllocFromRecord(HeapObject *record, DWORD dwFlags, SIZE_T dwBytes) {
 	if (isExecutableHeap(record)) {
 		kernel32::tryMarkExecutable(mem);
 	}
+	record->trackAllocation(mem);
 	return mem;
 }
 
@@ -164,6 +165,11 @@ LPVOID WINAPI HeapReAlloc(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBy
 		VERBOSE_LOG("-> %p (alloc)\n", alloc);
 		return alloc;
 	}
+	if (!record->ownsAllocation(lpMem)) {
+		VERBOSE_LOG("-> NULL (not owned)\n");
+		setLastError(ERROR_INVALID_PARAMETER);
+		return nullptr;
+	}
 	if ((record->createFlags | dwFlags) & HEAP_GENERATE_EXCEPTIONS) {
 		VERBOSE_LOG("-> NULL (exceptions unsupported)\n");
 		setLastError(ERROR_NOT_SUPPORTED);
@@ -173,7 +179,13 @@ LPVOID WINAPI HeapReAlloc(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBy
 	const bool zeroMemory = (dwFlags & HEAP_ZERO_MEMORY) != 0;
 	if (dwBytes == 0) {
 		if (!inplaceOnly) {
-			wibo::heap::guestFree(lpMem);
+			bool freed = record->heap ? record->heap->free(lpMem) : wibo::heap::guestFree(lpMem);
+			if (!freed) {
+				VERBOSE_LOG("-> NULL (free failed)\n");
+				setLastError(ERROR_INVALID_PARAMETER);
+				return nullptr;
+			}
+			record->releaseAllocation(lpMem);
 			VERBOSE_LOG("-> NULL (freed)\n");
 			return nullptr;
 		}
@@ -196,6 +208,12 @@ LPVOID WINAPI HeapReAlloc(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBy
 
 	void *ret = record->heap ? record->heap->realloc(lpMem, requestSize, zeroMemory)
 							 : wibo::heap::guestRealloc(lpMem, requestSize, zeroMemory);
+	if (!ret) {
+		VERBOSE_LOG("-> NULL\n");
+		setLastError(ERROR_NOT_ENOUGH_MEMORY);
+		return nullptr;
+	}
+	record->replaceAllocation(lpMem, ret);
 	if (isExecutableHeap(record.get())) {
 		tryMarkExecutable(ret);
 	}
@@ -218,6 +236,11 @@ SIZE_T WINAPI HeapSize(HANDLE hHeap, DWORD dwFlags, LPCVOID lpMem) {
 		setLastError(ERROR_INVALID_PARAMETER);
 		return static_cast<SIZE_T>(-1);
 	}
+	if (!record->ownsAllocation(lpMem)) {
+		VERBOSE_LOG("-> ERROR_INVALID_PARAMETER (not owned)\n");
+		setLastError(ERROR_INVALID_PARAMETER);
+		return static_cast<SIZE_T>(-1);
+	}
 	return static_cast<SIZE_T>(wibo::heap::guestSize(lpMem));
 }
 
@@ -234,13 +257,36 @@ BOOL WINAPI HeapFree(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem) {
 		setLastError(ERROR_INVALID_HANDLE);
 		return FALSE;
 	}
+	if (!record->ownsAllocation(lpMem)) {
+		VERBOSE_LOG("-> ERROR_INVALID_PARAMETER (not owned)\n");
+		setLastError(ERROR_INVALID_PARAMETER);
+		return FALSE;
+	}
 	bool ret = record->heap ? record->heap->free(lpMem) : wibo::heap::guestFree(lpMem);
 	if (!ret) {
 		VERBOSE_LOG("-> ERROR_INVALID_PARAMETER (not owned)\n");
 		setLastError(ERROR_INVALID_PARAMETER);
 		return FALSE;
 	}
+	record->releaseAllocation(lpMem);
 	VERBOSE_LOG("-> SUCCESS\n");
+	return TRUE;
+}
+
+BOOL WINAPI HeapValidate(HANDLE hHeap, DWORD dwFlags, LPCVOID lpMem) {
+	HOST_CONTEXT_GUARD();
+	VERBOSE_LOG("HeapValidate(%p, 0x%x, %p) ", hHeap, dwFlags, lpMem);
+	(void)dwFlags;
+	auto record = wibo::handles().getAs<HeapObject>(hHeap);
+	if (!record || !record->canAccess()) {
+		VERBOSE_LOG("-> FALSE (invalid heap)\n");
+		return FALSE;
+	}
+	if (lpMem && !record->ownsAllocation(lpMem)) {
+		VERBOSE_LOG("-> FALSE (not owned)\n");
+		return FALSE;
+	}
+	VERBOSE_LOG("-> TRUE\n");
 	return TRUE;
 }
 
