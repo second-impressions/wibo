@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "test_assert.h"
 
@@ -88,6 +89,26 @@ static void test_getsystemtimeasfiletime(void) {
     uint64_t delta = abs_u64_diff(filetime_to_u64(&from_api), filetime_to_u64(&from_system));
     /* allow 1 second of skew between calls */
     TEST_CHECK_MSG(delta < 10000000ULL, "GetSystemTimeAsFileTime skew too large: %llu", (unsigned long long)delta);
+}
+
+static void test_source_date_epoch(void) {
+    const char *epoch = getenv("SOURCE_DATE_EPOCH");
+    if (epoch == NULL || epoch[0] == '\0') {
+        return;
+    }
+
+    const uint64_t unix_seconds = _strtoui64(epoch, NULL, 10);
+    const uint64_t expected_ticks = 116444736000000000ULL + unix_seconds * 10000000ULL;
+
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    TEST_CHECK_U64_EQ(expected_ticks, filetime_to_u64(&ft));
+
+    SYSTEMTIME from_api;
+    GetSystemTime(&from_api);
+    FILETIME from_system;
+    TEST_CHECK(SystemTimeToFileTime(&from_api, &from_system));
+    TEST_CHECK_U64_EQ(expected_ticks, filetime_to_u64(&from_system));
 }
 
 static void test_gettickcount_progresses(void) {
@@ -186,9 +207,9 @@ int main(void) {
     test_systemtime_roundtrip();
     test_filetime_known_timestamp();
     test_getsystemtimeasfiletime();
+    test_source_date_epoch();
     test_gettickcount_progresses();
     test_setfiletime_roundtrip();
     test_local_filetime_conversions();
     return 0;
 }
-

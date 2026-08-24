@@ -7,8 +7,11 @@
 #include "ntdll.h"
 #include "timeutil.h"
 
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <limits>
 #include <sys/time.h>
 
 namespace {
@@ -20,6 +23,28 @@ constexpr uint64_t kUnixTimeZero = 11644473600ULL * 10000000ULL;
 constexpr DWORD kMajorVersion = 6;
 constexpr DWORD kMinorVersion = 2;
 constexpr DWORD kBuildNumber = 0;
+
+bool sourceDateEpoch(time_t &result) {
+	const char *value = std::getenv("SOURCE_DATE_EPOCH");
+	if (!value || !*value || *value == '-') {
+		return false;
+	}
+
+	char *end = nullptr;
+	errno = 0;
+	const unsigned long long parsed = std::strtoull(value, &end, 10);
+	if (errno == ERANGE || !end || *end != '\0' ||
+		parsed > static_cast<unsigned long long>(std::numeric_limits<time_t>::max())) {
+		return false;
+	}
+	result = static_cast<time_t>(parsed);
+	return true;
+}
+
+time_t currentWallTime() {
+	time_t epoch;
+	return sourceDateEpoch(epoch) ? epoch : time(nullptr);
+}
 
 DWORD_PTR computeSystemProcessorMask(unsigned int cpuCount) {
 	const auto maskWidth = static_cast<unsigned int>(sizeof(DWORD_PTR) * 8);
@@ -78,7 +103,7 @@ void WINAPI GetSystemTime(LPSYSTEMTIME lpSystemTime) {
 		return;
 	}
 
-	time_t now = time(nullptr);
+	time_t now = currentWallTime();
 	struct tm tmUtc{};
 #if defined(_GNU_SOURCE) || defined(__APPLE__)
 	gmtime_r(&now, &tmUtc);
@@ -107,7 +132,7 @@ void WINAPI GetLocalTime(LPSYSTEMTIME lpSystemTime) {
 		return;
 	}
 
-	time_t now = time(nullptr);
+	time_t now = currentWallTime();
 	struct tm tmLocal{};
 #if defined(_GNU_SOURCE) || defined(__APPLE__)
 	localtime_r(&now, &tmLocal);
@@ -133,6 +158,13 @@ void WINAPI GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime) {
 	HOST_CONTEXT_GUARD();
 	DEBUG_LOG("GetSystemTimeAsFileTime(%p)\n", lpSystemTimeAsFileTime);
 	if (!lpSystemTimeAsFileTime) {
+		return;
+	}
+	time_t epoch;
+	if (sourceDateEpoch(epoch)) {
+		uint64_t ticks = kUnixTimeZero;
+		ticks += static_cast<uint64_t>(epoch) * 10000000ULL;
+		*lpSystemTimeAsFileTime = fileTimeFromDuration(ticks);
 		return;
 	}
 

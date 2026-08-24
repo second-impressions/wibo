@@ -514,6 +514,12 @@ if (WIBO_ENABLE_FIXTURE_TESTS)
         wibo_add_fixture_bin(NAME test_actctx SOURCES test/test_actctx.c)
         wibo_add_fixture_bin(NAME test_overlapped_io SOURCES test/test_overlapped_io.c)
         wibo_add_fixture_bin(NAME test_time SOURCES test/test_time.c)
+        add_test(NAME wibo.test_time_source_date_epoch
+            COMMAND $<TARGET_FILE:wibo> ${WIBO_TEST_BIN_DIR}/test_time.exe)
+        set_tests_properties(wibo.test_time_source_date_epoch PROPERTIES
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test
+            DEPENDS wibo.build_fixtures
+            ENVIRONMENT "SOURCE_DATE_EPOCH=1672531200")
         wibo_add_fixture_bin(NAME test_ntdll_time SOURCES test/test_ntdll_time.c)
         wibo_add_fixture_bin(NAME test_virtualalloc SOURCES test/test_virtualalloc.c)
         wibo_add_fixture_bin(NAME test_virtualquery SOURCES test/test_virtualquery.c)
