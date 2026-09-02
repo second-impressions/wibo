@@ -8,6 +8,9 @@
 #include "modules.h"
 #include "resources.h"
 
+#include "strutil.h"
+
+#include <cctype>
 #include <cstring>
 
 namespace user32 {
@@ -39,6 +42,93 @@ LPSTR WINAPI CharNextExA(WORD CodePage, LPCSTR lpCurrentChar, DWORD dwFlags) {
 	if (kernel32::IsDBCSLeadByteEx(CodePage, static_cast<BYTE>(*current)) && current[1] != '\0')
 		return current + 2;
 	return current + 1;
+}
+
+// The Char* case-mapping family.  A pointer whose high word is zero is a
+// single character passed by value (the documented CharUpper/CharLower
+// contract), which rc.exe and other period tools rely on.
+static bool isCharValue(const void *p) { return (reinterpret_cast<uintptr_t>(p) & 0xFFFF0000u) == 0; }
+
+LPSTR WINAPI CharUpperA(LPSTR lpsz) {
+	HOST_CONTEXT_GUARD();
+	DEBUG_LOG("CharUpperA(%p)\n", lpsz);
+	if (isCharValue(lpsz))
+		return reinterpret_cast<LPSTR>(static_cast<uintptr_t>(toupper(static_cast<unsigned char>(reinterpret_cast<uintptr_t>(lpsz)))));
+	for (LPSTR p = lpsz; *p; ++p)
+		*p = static_cast<char>(toupper(static_cast<unsigned char>(*p)));
+	return lpsz;
+}
+
+LPWSTR WINAPI CharUpperW(LPWSTR lpsz) {
+	HOST_CONTEXT_GUARD();
+	DEBUG_LOG("CharUpperW(%p)\n", lpsz);
+	if (isCharValue(lpsz))
+		return reinterpret_cast<LPWSTR>(static_cast<uintptr_t>(wcharToUpper(static_cast<uint16_t>(reinterpret_cast<uintptr_t>(lpsz)))));
+	for (uint16_t *p = reinterpret_cast<uint16_t *>(lpsz); *p; ++p)
+		*p = wcharToUpper(*p);
+	return lpsz;
+}
+
+DWORD WINAPI CharUpperBuffA(LPSTR lpsz, DWORD cchLength) {
+	HOST_CONTEXT_GUARD();
+	DEBUG_LOG("CharUpperBuffA(%p, %u)\n", lpsz, cchLength);
+	if (!lpsz)
+		return 0;
+	for (DWORD i = 0; i < cchLength; ++i)
+		lpsz[i] = static_cast<char>(toupper(static_cast<unsigned char>(lpsz[i])));
+	return cchLength;
+}
+
+DWORD WINAPI CharUpperBuffW(LPWSTR lpsz, DWORD cchLength) {
+	HOST_CONTEXT_GUARD();
+	DEBUG_LOG("CharUpperBuffW(%p, %u)\n", lpsz, cchLength);
+	if (!lpsz)
+		return 0;
+	auto *p = reinterpret_cast<uint16_t *>(lpsz);
+	for (DWORD i = 0; i < cchLength; ++i)
+		p[i] = wcharToUpper(p[i]);
+	return cchLength;
+}
+
+LPSTR WINAPI CharLowerA(LPSTR lpsz) {
+	HOST_CONTEXT_GUARD();
+	DEBUG_LOG("CharLowerA(%p)\n", lpsz);
+	if (isCharValue(lpsz))
+		return reinterpret_cast<LPSTR>(static_cast<uintptr_t>(tolower(static_cast<unsigned char>(reinterpret_cast<uintptr_t>(lpsz)))));
+	for (LPSTR p = lpsz; *p; ++p)
+		*p = static_cast<char>(tolower(static_cast<unsigned char>(*p)));
+	return lpsz;
+}
+
+LPWSTR WINAPI CharLowerW(LPWSTR lpsz) {
+	HOST_CONTEXT_GUARD();
+	DEBUG_LOG("CharLowerW(%p)\n", lpsz);
+	if (isCharValue(lpsz))
+		return reinterpret_cast<LPWSTR>(static_cast<uintptr_t>(wcharToLower(static_cast<uint16_t>(reinterpret_cast<uintptr_t>(lpsz)))));
+	for (uint16_t *p = reinterpret_cast<uint16_t *>(lpsz); *p; ++p)
+		*p = wcharToLower(*p);
+	return lpsz;
+}
+
+DWORD WINAPI CharLowerBuffA(LPSTR lpsz, DWORD cchLength) {
+	HOST_CONTEXT_GUARD();
+	DEBUG_LOG("CharLowerBuffA(%p, %u)\n", lpsz, cchLength);
+	if (!lpsz)
+		return 0;
+	for (DWORD i = 0; i < cchLength; ++i)
+		lpsz[i] = static_cast<char>(tolower(static_cast<unsigned char>(lpsz[i])));
+	return cchLength;
+}
+
+DWORD WINAPI CharLowerBuffW(LPWSTR lpsz, DWORD cchLength) {
+	HOST_CONTEXT_GUARD();
+	DEBUG_LOG("CharLowerBuffW(%p, %u)\n", lpsz, cchLength);
+	if (!lpsz)
+		return 0;
+	auto *p = reinterpret_cast<uint16_t *>(lpsz);
+	for (DWORD i = 0; i < cchLength; ++i)
+		p[i] = wcharToLower(p[i]);
+	return cchLength;
 }
 
 int WINAPI LoadStringA(HMODULE hInstance, UINT uID, LPSTR lpBuffer, int cchBufferMax) {
