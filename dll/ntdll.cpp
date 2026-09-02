@@ -1,5 +1,7 @@
 #include "ntdll.h"
 
+#include "kernel32/sysinfoapi.h"
+
 #include "common.h"
 #include "context.h"
 #include "errors.h"
@@ -562,11 +564,12 @@ NTSTATUS WINAPI NtQuerySystemTime(PLARGE_INTEGER SystemTime) {
 		return STATUS_ACCESS_VIOLATION;
 	}
 
-	using HundredNanoseconds = std::chrono::duration<long long, std::ratio<1, 10000000>>;
-	auto now = std::chrono::system_clock::now().time_since_epoch();
-	auto sinceUnix = std::chrono::duration_cast<HundredNanoseconds>(now).count();
-	ULONGLONG fileTime = kUnixEpochAsFileTime + static_cast<ULONGLONG>(sinceUnix);
-	SystemTime->QuadPart = static_cast<LONGLONG>(fileTime);
+	// One wall clock for the whole process: kernel32 already honours
+	// SOURCE_DATE_EPOCH, and LINK reads its PE timestamp through this entry
+	// while its CRT reads GetSystemTimeAsFileTime, so both must agree.
+	FILETIME ft{};
+	kernel32::GetSystemTimeAsFileTime(&ft);
+	SystemTime->QuadPart = static_cast<LONGLONG>((static_cast<ULONGLONG>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime);
 
 	DEBUG_LOG("-> 0x%x\n", STATUS_SUCCESS);
 	return STATUS_SUCCESS;
